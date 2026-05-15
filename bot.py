@@ -1,125 +1,215 @@
-"""
-Freelance Parser Bot for VK
-Парсер заказов и упоминаний с фриланс-бирж, Telegram, VK-групп, RSS-лент
-"""
+"""VK Parser Bot.
 
-import vk_api
-from vk_api.longpoll import VkLongPoll, VkEventType
-from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+VK-only bot for finding order-like posts in configured VK groups.
+Configuration priority: environment/.env -> config.json -> defaults.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
 import threading
 import time
-import logging
-import json
-import os
-from datetime import datetime
+from typing import Dict, List
 
-from parsers.freelance_ru import parse_freelance_ru
-from parsers.kwork import parse_kwork
-from parsers.fl_ru import parse_fl_ru
-from parsers.hh_ru import parse_hh_ru
-from parsers.upwork import parse_upwork
-from parsers.rss_parser import parse_rss_sources
-from parsers.telegram_parser import parse_telegram_channels
-from parsers.vk_parser import parse_vk_groups
-from data.categories import CATEGORIES_RU, CATEGORIES_EN
-from data.sources import RSS_SOURCES, TELEGRAM_CHANNELS, VK_GROUPS
+import vk_api
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+from vk_api.longpoll import VkEventType, VkLongPoll
 
-# ─── Logging ────────────────────────────────────────────────────────────────
+from data.categories import CATEGORIES_RU
+from data.sources import load_vk_groups_from_env
+from parsers.vk_parser import parse_vk_groups, set_vk_token
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("logs/bot.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(os.path.join(LOG_DIR, "bot.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
-# ─── Config ─────────────────────────────────────────────────────────────────
-with open("config.json", encoding="utf-8") as f:
-    CONFIG = json.load(f)
 
-VK_TOKEN = CONFIG["vk_token"]
-ADMIN_IDS = CONFIG.get("admin_ids", [])
-PARSE_INTERVAL = CONFIG.get("parse_interval_minutes", 30)
-
-# ─── State storage (in-memory, persisted to JSON) ────────────────────────────
-USERS_FILE = "data/users.json"
-SEEN_FILE = "data/seen_ids.json"
-
-
-def load_json(path, default):
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    return default
+def load_dotenv_file(path: str = ".env") -> None:
+    env_path = path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def load_config() -> Dict[str, object]:
+    load_dotenv_file()
+    config_path = os.path.join(BASE_DIR, "config.json")
+    data: Dict[str, object] = {}
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as file:
+                data = json.load(file)
+        except Exception as exc:
+            logger.warning("config.json не прочитан: %s", exc)
+
+    parser_token = (
+        os.environ.get("VK_PARSER_TOKEN")
+        or os.environ.get("VK_SERVICE_TOKEN")
+        or os.environ.get("VK_TOKEN")
+        or str(data.get("vk_parser_token") or data.get("vk_service_token") or data.get("vk_token") or "")
+    )
+    bot_token = (
+        os.environ.get("VK_BOT_TOKEN")
+        or os.environ.get("VK_TOKEN")
+        or str(data.get("vk_bot_token") or data.get("vk_token") or "")
+    )
+    admin_ids_raw = os.environ.get("ADMIN_IDS")
+    if admin_ids_raw is None:
+        admin_ids_raw = ",".join(map(str, data.get("admin_ids") or []))
+    interval_raw = os.environ.get("PARSE_INTERVAL_MINUTES") or str(data.get("parse_interval_minutes") or "10")
+    posts_raw = os.environ.get("VK_POSTS_PER_GROUP") or str(data.get("vk_posts_per_group") or "30")
+
+    try:
+        interval = max(1, int(interval_raw))
+    except ValueError:
+        interval = 10
+    try:
+        posts_per_group = max(1, min(int(posts_raw), 100))
+    except ValueError:
+        posts_per_group = 30
+
+    admin_ids: List[int] = []
+    for part in str(admin_ids_raw or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            admin_ids.append(int(part))
+
+    return {
+        "vk_token": parser_token.strip(),
+        "vk_bot_token": bot_token.strip(),
+        "admin_ids": admin_ids,
+        "parse_interval_minutes": interval,
+        "vk_posts_per_group": posts_per_group,
+    }
 
 
-# user_id -> {lang: "ru"|"en", categories: [...], active: bool}
-users = load_json(USERS_FILE, {})
-# set of already-sent item IDs to avoid duplicates
+CONFIG = load_config()
+VK_TOKEN = str(CONFIG["vk_token"])
+VK_BOT_TOKEN = str(CONFIG["vk_bot_token"])
+ADMIN_IDS = CONFIG["admin_ids"]
+PARSE_INTERVAL = int(CONFIG["parse_interval_minutes"])
+VK_POSTS_PER_GROUP = int(CONFIG["vk_posts_per_group"])
+set_vk_token(VK_TOKEN)
+VK_GROUPS = load_vk_groups_from_env()
+
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+SEEN_FILE = os.path.join(DATA_DIR, "seen_ids.json")
+
+
+def load_json(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return default
+
+
+def save_json(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+users: Dict[str, Dict[str, object]] = load_json(USERS_FILE, {})
 seen_ids = set(load_json(SEEN_FILE, []))
 
+vk_session = None
+vk = None
+longpoll = None
 
-def save_users():
+
+def setup_vk():
+    global vk_session, vk, longpoll
+    if not VK_BOT_TOKEN or VK_BOT_TOKEN.startswith("YOUR_"):
+        raise RuntimeError("Не задан VK_BOT_TOKEN. Заполни .env перед запуском бота.")
+    if vk_session is None:
+        vk_session = vk_api.VkApi(token=VK_BOT_TOKEN)
+        vk = vk_session.get_api()
+        longpoll = VkLongPoll(vk_session)
+    return vk, longpoll
+
+
+def save_users() -> None:
     save_json(USERS_FILE, users)
 
 
-def save_seen():
-    save_json(SEEN_FILE, list(seen_ids))
+def save_seen() -> None:
+    save_json(SEEN_FILE, sorted(seen_ids))
 
 
-# ─── VK API setup ────────────────────────────────────────────────────────────
-vk_session = vk_api.VkApi(token=VK_TOKEN)
-vk = vk_session.get_api()
-longpoll = VkLongPoll(vk_session)
+def get_user(user_id: int) -> Dict[str, object]:
+    uid = str(user_id)
+    if uid not in users:
+        users[uid] = {"categories": ["web_it"], "active": True, "menu": "main"}
+        save_users()
+    return users[uid]
 
-
-def send_message(user_id, text, keyboard=None):
-    """Send message to user with optional keyboard."""
-    params = {
-        "user_id": user_id,
-        "message": text,
-        "random_id": int(time.time() * 1000),
-    }
-    if keyboard:
-        params["keyboard"] = keyboard.get_keyboard()
-    try:
-        vk.messages.send(**params)
-    except Exception as e:
-        logger.error(f"send_message error to {user_id}: {e}")
-
-
-# ─── Keyboards ───────────────────────────────────────────────────────────────
 
 def kb_main_menu():
     kb = VkKeyboard(one_time=False)
-    kb.add_button("🇷🇺 Русские заказы", color=VkKeyboardColor.PRIMARY)
-    kb.add_button("🇺🇸 English orders", color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
+    kb.add_button("📂 Категории", color=VkKeyboardColor.PRIMARY)
     kb.add_button("📋 Мои категории", color=VkKeyboardColor.SECONDARY)
+    kb.add_line()
+    kb.add_button("🔄 Проверить VK сейчас", color=VkKeyboardColor.POSITIVE)
     kb.add_button("🔔 Подписка вкл/выкл", color=VkKeyboardColor.SECONDARY)
     kb.add_line()
-    kb.add_button("🔄 Обновить сейчас", color=VkKeyboardColor.POSITIVE)
     kb.add_button("ℹ️ Помощь", color=VkKeyboardColor.SECONDARY)
     return kb
 
 
-def kb_categories_ru(selected: list):
+CATEGORY_PAGE_SIZE = 12
+
+
+def get_category_page(user: Dict[str, object]) -> int:
+    try:
+        return max(0, int(user.get("category_page", 0)))
+    except Exception:
+        return 0
+
+
+def kb_categories(selected: List[str], page: int = 0):
+    """VK keyboards have row/count limits, so categories are paginated."""
     kb = VkKeyboard(one_time=False)
-    cats = list(CATEGORIES_RU.items())
-    # 2 per row
-    for i, (key, label) in enumerate(cats):
+    items = list(CATEGORIES_RU.items())
+    total_pages = max(1, (len(items) + CATEGORY_PAGE_SIZE - 1) // CATEGORY_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = items[page * CATEGORY_PAGE_SIZE:(page + 1) * CATEGORY_PAGE_SIZE]
+
+    for index, (key, label) in enumerate(chunk):
         mark = "✅ " if key in selected else ""
         color = VkKeyboardColor.POSITIVE if key in selected else VkKeyboardColor.SECONDARY
         kb.add_button(f"{mark}{label}", color=color)
-        if (i + 1) % 2 == 0 and i + 1 < len(cats):
+        if (index + 1) % 2 == 0 and index + 1 < len(chunk):
             kb.add_line()
+
+    kb.add_line()
+    if page > 0:
+        kb.add_button("⬅️ Предыдущие", color=VkKeyboardColor.SECONDARY)
+    if page < total_pages - 1:
+        kb.add_button("➡️ Следующие", color=VkKeyboardColor.SECONDARY)
     kb.add_line()
     kb.add_button("✅ Выбрать все", color=VkKeyboardColor.PRIMARY)
     kb.add_button("❌ Снять все", color=VkKeyboardColor.NEGATIVE)
@@ -128,54 +218,32 @@ def kb_categories_ru(selected: list):
     return kb
 
 
-def kb_categories_en(selected: list):
-    kb = VkKeyboard(one_time=False)
-    cats = list(CATEGORIES_EN.items())
-    for i, (key, label) in enumerate(cats):
-        mark = "✅ " if key in selected else ""
-        color = VkKeyboardColor.POSITIVE if key in selected else VkKeyboardColor.SECONDARY
-        kb.add_button(f"{mark}{label}", color=color)
-        if (i + 1) % 2 == 0 and i + 1 < len(cats):
-            kb.add_line()
-    kb.add_line()
-    kb.add_button("✅ Select all", color=VkKeyboardColor.PRIMARY)
-    kb.add_button("❌ Clear all", color=VkKeyboardColor.NEGATIVE)
-    kb.add_line()
-    kb.add_button("◀️ Back", color=VkKeyboardColor.SECONDARY)
-    return kb
-
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-
-def get_user(user_id: str) -> dict:
-    uid = str(user_id)
-    if uid not in users:
-        users[uid] = {
-            "lang": "ru",
-            "categories": [],
-            "active": True,
-            "menu": "main"
+def send_message(user_id: int, text: str, keyboard=None) -> None:
+    try:
+        api, _ = setup_vk()
+        params = {
+            "user_id": user_id,
+            "message": text[:3900],
+            "random_id": int(time.time() * 1_000_000),
         }
-        save_users()
-    return users[uid]
+        if keyboard:
+            params["keyboard"] = keyboard.get_keyboard()
+        api.messages.send(**params)
+    except Exception as exc:
+        logger.error("send_message error to %s: %s", user_id, exc)
 
 
-def format_item(item: dict) -> str:
-    """Format a parsed order/mention for display."""
+def format_item(item: Dict[str, str]) -> str:
     lines = []
     if item.get("source"):
         lines.append(f"📌 {item['source']}")
     if item.get("title"):
         lines.append(f"📝 {item['title']}")
     if item.get("description"):
-        desc = item["description"][:300]
-        if len(item["description"]) > 300:
-            desc += "..."
+        desc = item["description"][:500] + ("..." if len(item["description"]) > 500 else "")
         lines.append(f"💬 {desc}")
     if item.get("budget"):
         lines.append(f"💰 {item['budget']}")
-    if item.get("category"):
-        lines.append(f"🏷 {item['category']}")
     if item.get("url"):
         lines.append(f"🔗 {item['url']}")
     if item.get("published"):
@@ -183,302 +251,193 @@ def format_item(item: dict) -> str:
     return "\n".join(lines)
 
 
-# ─── Parsing dispatcher ──────────────────────────────────────────────────────
-
-def run_all_parsers(categories: list, lang: str = "ru") -> list:
-    """Run all parsers and return merged list of items filtered by categories."""
-    items = []
-    try:
-        if lang == "ru":
-            items += parse_fl_ru(categories)
-            items += parse_kwork(categories)
-            items += parse_freelance_ru(categories)
-            items += parse_hh_ru(categories)
-            items += parse_rss_sources(RSS_SOURCES["ru"], categories)
-            items += parse_vk_groups(VK_GROUPS, categories)
-            items += parse_telegram_channels(TELEGRAM_CHANNELS["ru"], categories)
-        else:
-            items += parse_upwork(categories)
-            items += parse_rss_sources(RSS_SOURCES["en"], categories)
-            items += parse_telegram_channels(TELEGRAM_CHANNELS["en"], categories)
-    except Exception as e:
-        logger.error(f"Parser error: {e}")
-
-    # Deduplicate by unique_id
-    new_items = []
+def run_vk_parser(categories: List[str], dedupe: bool = True) -> List[Dict[str, str]]:
+    items = parse_vk_groups(VK_GROUPS, categories, token=VK_TOKEN, count=VK_POSTS_PER_GROUP, only_orders=True)
+    fresh = []
     for item in items:
-        uid = item.get("unique_id", "")
-        if uid and uid not in seen_ids:
+        uid = item.get("unique_id") or item.get("url") or item.get("title")
+        if not uid:
+            continue
+        if not dedupe or uid not in seen_ids:
             seen_ids.add(uid)
-            new_items.append(item)
-
-    if new_items:
+            fresh.append(item)
+    if fresh and dedupe:
         save_seen()
-    return new_items
+    return fresh
 
 
-# ─── Background worker ───────────────────────────────────────────────────────
-
-def background_parser():
-    """Periodically parse all sources and push results to subscribed users."""
-    logger.info("Background parser started")
-    while True:
-        time.sleep(PARSE_INTERVAL * 60)
-        logger.info("Starting scheduled parse cycle")
-        for uid, udata in list(users.items()):
-            if not udata.get("active", True):
-                continue
-            cats = udata.get("categories", [])
-            if not cats:
-                continue
-            lang = udata.get("lang", "ru")
-            try:
-                items = run_all_parsers(cats, lang)
-                if items:
-                    header = "🔔 Новые заказы:" if lang == "ru" else "🔔 New orders:"
-                    send_message(int(uid), header)
-                    for item in items[:20]:  # max 20 per cycle
-                        send_message(int(uid), format_item(item))
-                        time.sleep(0.5)
-            except Exception as e:
-                logger.error(f"Error sending to {uid}: {e}")
-
-
-# ─── Command handlers ─────────────────────────────────────────────────────────
-
-def handle_start(user_id):
-    u = get_user(user_id)
-    u["menu"] = "main"
+def handle_start(user_id: int) -> None:
+    user = get_user(user_id)
+    user["menu"] = "main"
     save_users()
     send_message(
         user_id,
-        "👋 Привет! Я бот-парсер заказов с фриланс-бирж, Telegram-каналов, VK-групп и RSS.\n\n"
-        "Выбери раздел и категории — и я буду присылать тебе свежие заявки автоматически!\n\n"
-        "🇷🇺 Русские источники: fl.ru, kwork, freelance.ru, hh.ru, VK-группы, Telegram, RSS\n"
-        "🇺🇸 English sources: Upwork, Telegram EN, RSS EN",
-        kb_main_menu()
+        "👋 Бот готов искать заказы только во VK-группах.\n\n"
+        "По умолчанию включена категория IT/разработка. Можно выбрать другие категории и нажать «Проверить VK сейчас».\n"
+        f"Групп подключено: {len(VK_GROUPS)}. Автопроверка: каждые {PARSE_INTERVAL} мин.",
+        kb_main_menu(),
     )
 
 
-def handle_ru_categories(user_id):
-    u = get_user(user_id)
-    u["menu"] = "cats_ru"
-    u["lang"] = "ru"
+def handle_categories(user_id: int) -> None:
+    user = get_user(user_id)
+    user["menu"] = "categories"
     save_users()
-    send_message(
-        user_id,
-        "🇷🇺 Выбери категории для поиска заказов (нажимай — отмечается ✅):",
-        kb_categories_ru(u.get("categories", []))
-    )
+    page = get_category_page(user)
+    send_message(user_id, f"Выбери категории для VK-парсинга. Страница {page + 1}.", kb_categories(user.get("categories", []), page))
 
 
-def handle_en_categories(user_id):
-    u = get_user(user_id)
-    u["menu"] = "cats_en"
-    u["lang"] = "en"
-    save_users()
-    send_message(
-        user_id,
-        "🇺🇸 Select categories for order search (tap to toggle ✅):",
-        kb_categories_en(u.get("categories", []))
-    )
-
-
-def handle_toggle_category(user_id, text):
-    u = get_user(user_id)
-    cats = u.get("categories", [])
-    lang = u.get("lang", "ru")
-    cat_map = CATEGORIES_RU if lang == "ru" else CATEGORIES_EN
-
-    # Find category key by label (strip checkmark prefix)
-    clean_text = text.replace("✅ ", "").strip()
-    matched_key = None
-    for key, label in cat_map.items():
-        if label == clean_text:
-            matched_key = key
+def handle_toggle_category(user_id: int, text: str) -> None:
+    user = get_user(user_id)
+    selected = list(user.get("categories", []))
+    clean = text.replace("✅ ", "").strip()
+    matched = None
+    for key, label in CATEGORIES_RU.items():
+        if label == clean:
+            matched = key
             break
-
-    if matched_key:
-        if matched_key in cats:
-            cats.remove(matched_key)
-        else:
-            cats.append(matched_key)
-        u["categories"] = cats
-        save_users()
-        kb = kb_categories_ru(cats) if lang == "ru" else kb_categories_en(cats)
-        chosen = [cat_map[k] for k in cats if k in cat_map]
-        msg = f"✅ Выбрано ({len(chosen)}): {', '.join(chosen) if chosen else 'ничего'}"
-        if lang == "en":
-            msg = f"✅ Selected ({len(chosen)}): {', '.join(chosen) if chosen else 'none'}"
-        send_message(user_id, msg, kb)
-
-
-def handle_select_all(user_id):
-    u = get_user(user_id)
-    lang = u.get("lang", "ru")
-    cat_map = CATEGORIES_RU if lang == "ru" else CATEGORIES_EN
-    u["categories"] = list(cat_map.keys())
-    save_users()
-    kb = kb_categories_ru(u["categories"]) if lang == "ru" else kb_categories_en(u["categories"])
-    msg = "✅ Все категории выбраны!" if lang == "ru" else "✅ All categories selected!"
-    send_message(user_id, msg, kb)
-
-
-def handle_clear_all(user_id):
-    u = get_user(user_id)
-    lang = u.get("lang", "ru")
-    u["categories"] = []
-    save_users()
-    kb = kb_categories_ru([]) if lang == "ru" else kb_categories_en([])
-    msg = "❌ Все категории сняты" if lang == "ru" else "❌ All categories cleared"
-    send_message(user_id, msg, kb)
-
-
-def handle_my_categories(user_id):
-    u = get_user(user_id)
-    cats = u.get("categories", [])
-    lang = u.get("lang", "ru")
-    cat_map = CATEGORIES_RU if lang == "ru" else CATEGORIES_EN
-    labels = [cat_map.get(k, k) for k in cats]
-    if labels:
-        msg = "📋 Твои категории:\n• " + "\n• ".join(labels)
-    else:
-        msg = "📋 Категории не выбраны. Нажми 🇷🇺 или 🇺🇸 для выбора."
-    send_message(user_id, msg, kb_main_menu())
-
-
-def handle_toggle_subscription(user_id):
-    u = get_user(user_id)
-    u["active"] = not u.get("active", True)
-    save_users()
-    if u["active"]:
-        send_message(user_id, "🔔 Автоуведомления включены!", kb_main_menu())
-    else:
-        send_message(user_id, "🔕 Автоуведомления отключены.", kb_main_menu())
-
-
-def handle_fetch_now(user_id):
-    u = get_user(user_id)
-    cats = u.get("categories", [])
-    lang = u.get("lang", "ru")
-    if not cats:
-        msg = "⚠️ Сначала выбери категории!" if lang == "ru" else "⚠️ Please select categories first!"
-        send_message(user_id, msg, kb_main_menu())
+    if not matched:
+        send_message(user_id, "Категория не распознана.", kb_categories(selected, get_category_page(user)))
         return
-
-    msg = "🔄 Ищу заказы, подожди..." if lang == "ru" else "🔄 Fetching orders, please wait..."
-    send_message(user_id, msg)
-
-    def fetch_and_send():
-        items = run_all_parsers(cats, lang)
-        if items:
-            header = f"🎯 Найдено {len(items)} заказов:" if lang == "ru" else f"🎯 Found {len(items)} orders:"
-            send_message(user_id, header)
-            for item in items[:15]:
-                send_message(user_id, format_item(item))
-                time.sleep(0.4)
-        else:
-            msg2 = "😔 Новых заказов пока нет. Попробуй позже." if lang == "ru" else "😔 No new orders found. Try later."
-            send_message(user_id, msg2, kb_main_menu())
-
-    threading.Thread(target=fetch_and_send, daemon=True).start()
+    if matched in selected:
+        selected.remove(matched)
+    else:
+        selected.append(matched)
+    user["categories"] = selected
+    save_users()
+    labels = [CATEGORIES_RU.get(key, key) for key in selected]
+    send_message(user_id, "✅ Выбрано: " + (", ".join(labels) if labels else "ничего"), kb_categories(selected, get_category_page(user)))
 
 
-def handle_help(user_id):
+def handle_my_categories(user_id: int) -> None:
+    user = get_user(user_id)
+    labels = [CATEGORIES_RU.get(key, key) for key in user.get("categories", [])]
+    send_message(user_id, "📋 Категории:\n• " + "\n• ".join(labels) if labels else "📋 Категории не выбраны.", kb_main_menu())
+
+
+def handle_select_all(user_id: int) -> None:
+    user = get_user(user_id)
+    user["categories"] = list(CATEGORIES_RU.keys())
+    save_users()
+    send_message(user_id, "✅ Все категории выбраны.", kb_categories(user["categories"], get_category_page(user)))
+
+
+def handle_clear_all(user_id: int) -> None:
+    user = get_user(user_id)
+    user["categories"] = []
+    save_users()
+    send_message(user_id, "❌ Категории сняты. Без категорий бот принимает все подходящие VK-посты.", kb_categories([], get_category_page(user)))
+
+
+def handle_toggle_subscription(user_id: int) -> None:
+    user = get_user(user_id)
+    user["active"] = not bool(user.get("active", True))
+    save_users()
+    send_message(user_id, "🔔 Автоуведомления включены." if user["active"] else "🔕 Автоуведомления отключены.", kb_main_menu())
+
+
+def handle_fetch_now(user_id: int) -> None:
+    user = get_user(user_id)
+    categories = list(user.get("categories", []))
+    send_message(user_id, "🔄 Проверяю VK-группы...")
+
+    def worker():
+        items = run_vk_parser(categories, dedupe=True)
+        if not items:
+            send_message(user_id, "Пока новых VK-заказов нет.", kb_main_menu())
+            return
+        send_message(user_id, f"🎯 Найдено новых VK-заказов: {len(items)}")
+        for item in items[:15]:
+            send_message(user_id, format_item(item))
+            time.sleep(0.35)
+        send_message(user_id, "Готово.", kb_main_menu())
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def handle_help(user_id: int) -> None:
+    groups = ", ".join(group["domain"] for group in VK_GROUPS[:10])
     send_message(
         user_id,
-        "ℹ️ Как пользоваться ботом:\n\n"
-        "1️⃣ Нажми 🇷🇺 или 🇺🇸 для выбора языка заказов\n"
-        "2️⃣ Выбери интересующие категории (можно несколько)\n"
-        "3️⃣ Нажми 🔄 Обновить сейчас — получишь свежие заказы\n"
-        "4️⃣ Включи 🔔 Подписку — бот будет присылать заказы автоматически\n\n"
-        f"🕐 Автообновление каждые {PARSE_INTERVAL} мин.\n\n"
-        "📦 Источники RU: fl.ru, kwork.ru, freelance.ru, hh.ru, VK-группы, Telegram-каналы, RSS\n"
-        "📦 Источники EN: Upwork, Telegram EN, RSS EN",
-        kb_main_menu()
+        "ℹ️ Бот парсит только VK.\n\n"
+        "Команды:\n"
+        "• 📂 Категории — фильтр по тематике\n"
+        "• 🔄 Проверить VK сейчас — ручной поиск\n"
+        "• 🔔 Подписка — автоматическая отправка новых постов\n\n"
+        f"VK-группы: {groups}\n"
+        "Чтобы заменить группы, отредактируй VK_GROUPS в .env через запятую.",
+        kb_main_menu(),
     )
 
 
-# ─── Main message router ─────────────────────────────────────────────────────
+def route_message(user_id: int, text: str) -> None:
+    user = get_user(user_id)
+    menu = str(user.get("menu", "main"))
+    lowered = (text or "").lower().strip()
 
-def route_message(user_id, text: str):
-    u = get_user(user_id)
-    menu = u.get("menu", "main")
-    lang = u.get("lang", "ru")
-
-    # Universal commands
-    if text in ["/start", "start", "начать", "старт"]:
+    if lowered in {"/start", "start", "начать", "старт"}:
         handle_start(user_id)
-        return
-
-    if "🇷🇺" in text or "русские" in text.lower():
-        handle_ru_categories(user_id)
-        return
-
-    if "🇺🇸" in text or "english" in text.lower():
-        handle_en_categories(user_id)
-        return
-
-    if "мои категории" in text.lower() or "my categories" in text.lower() or "📋" in text:
+    elif "мои категории" in lowered or "📋" in text:
         handle_my_categories(user_id)
-        return
-
-    if "подписка" in text.lower() or "subscription" in text.lower() or "🔔" in text:
-        handle_toggle_subscription(user_id)
-        return
-
-    if "обновить" in text.lower() or "update" in text.lower() or "fetch" in text.lower() or "🔄" in text:
+    elif "категор" in lowered or "📂" in text:
+        handle_categories(user_id)
+    elif "проверить" in lowered or "обновить" in lowered or "🔄" in text:
         handle_fetch_now(user_id)
-        return
-
-    if "помощь" in text.lower() or "help" in text.lower() or "ℹ️" in text:
+    elif "подписка" in lowered or "🔔" in text:
+        handle_toggle_subscription(user_id)
+    elif "помощь" in lowered or "help" in lowered or "ℹ️" in text:
         handle_help(user_id)
-        return
-
-    if "◀️" in text or "назад" in text.lower() or "back" in text.lower():
-        u["menu"] = "main"
+    elif "выбрать все" in lowered:
+        handle_select_all(user_id)
+    elif "снять все" in lowered or "❌" in text:
+        handle_clear_all(user_id)
+    elif "следующие" in lowered or "➡️" in text:
+        user["category_page"] = get_category_page(user) + 1
+        save_users()
+        handle_categories(user_id)
+    elif "предыдущие" in lowered or "⬅️" in text:
+        user["category_page"] = max(0, get_category_page(user) - 1)
+        save_users()
+        handle_categories(user_id)
+    elif "назад" in lowered or "◀️" in text:
+        user["menu"] = "main"
         save_users()
         send_message(user_id, "Главное меню:", kb_main_menu())
-        return
-
-    if "выбрать все" in text.lower() or "select all" in text.lower() or "✅ выбр" in text.lower() or "✅ select" in text.lower():
-        handle_select_all(user_id)
-        return
-
-    if "снять все" in text.lower() or "clear all" in text.lower() or "❌" in text:
-        handle_clear_all(user_id)
-        return
-
-    # Category toggle
-    if menu in ("cats_ru", "cats_en"):
+    elif menu == "categories":
         handle_toggle_category(user_id, text)
-        return
-
-    # Default
-    send_message(user_id, "Используй кнопки меню 👇", kb_main_menu())
+    else:
+        send_message(user_id, "Используй кнопки меню.", kb_main_menu())
 
 
-# ─── Entry point ─────────────────────────────────────────────────────────────
-
-def main():
-    logger.info("Bot starting...")
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("data", exist_ok=True)
-
-    # Start background parser thread
-    parser_thread = threading.Thread(target=background_parser, daemon=True)
-    parser_thread.start()
-
-    logger.info("Listening for messages...")
-    for event in longpoll.listen():
-        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-            user_id = event.user_id
-            text = (event.text or "").strip()
-            logger.info(f"Message from {user_id}: {text!r}")
+def background_parser() -> None:
+    logger.info("VK background parser started")
+    while True:
+        time.sleep(PARSE_INTERVAL * 60)
+        for uid, data in list(users.items()):
+            if not data.get("active", True):
+                continue
             try:
-                route_message(user_id, text)
-            except Exception as e:
-                logger.error(f"Handler error: {e}")
+                items = run_vk_parser(list(data.get("categories", [])), dedupe=True)
+                if items:
+                    send_message(int(uid), f"🔔 Новые VK-заказы: {len(items)}")
+                    for item in items[:20]:
+                        send_message(int(uid), format_item(item))
+                        time.sleep(0.35)
+            except Exception as exc:
+                logger.exception("Background error for %s: %s", uid, exc)
+
+
+def main() -> None:
+    setup_vk()
+    threading.Thread(target=background_parser, daemon=True).start()
+    logger.info("VK bot started. Groups: %s", [group["domain"] for group in VK_GROUPS])
+    _, lp = setup_vk()
+    for event in lp.listen():
+        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+            try:
+                route_message(event.user_id, (event.text or "").strip())
+            except Exception as exc:
+                logger.exception("Handler error: %s", exc)
 
 
 if __name__ == "__main__":
