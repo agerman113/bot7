@@ -1,0 +1,6 @@
+{
+  "vk_token": "YOUR_REAL_VK_TOKEN_HERE",
+  "admin_ids": [],
+  "parse_interval_minutes": 10,
+  "vk_posts_per_group": 30
+}
