@@ -1,0 +1,17 @@
+{
+  "111": {
+    "categories": [
+      "web_it"
+    ],
+    "active": true,
+    "menu": "categories",
+    "category_page": 1
+  },
+  "123": {
+    "categories": [
+      "web_it"
+    ],
+    "active": true,
+    "menu": "main"
+  }
+}
